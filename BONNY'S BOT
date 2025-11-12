@@ -1,0 +1,296 @@
+# ai_over_under_bot.py
+"""
+AI-assisted Over/Under-5 bot scaffold.
+- Train an ML model on historical ticks (CSV).
+- Backtest Over/Under-5 using the model.
+- Live skeleton: subscribe to ticks, predict, risk-manage, and (placeholder) call Deriv proposal->buy.
+
+IMPORTANT: This is educational. No guarantees. Test on demo account first.
+"""
+
+import os
+import time
+import json
+import joblib
+import requests
+import threading
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from queue import Queue
+
+# --------------------
+# CONFIG
+# --------------------
+MODEL_PATH = "model_rf.joblib"
+HISTORICAL_TICKS_CSV = "historical_ticks.csv"  # CSV with columns: epoch, quote
+TRAIN_TEST_SPLIT = 0.2
+RANDOM_SEED = 42
+
+# Live config placeholders
+API_TOKEN = "YOUR_DERIV_API_TOKEN"   # put your token if going live
+WS_URL = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
+SYMBOL = "R_100"
+DURATION = 5   # Over/Under 5 ticks
+STAKE = 1.0
+MAX_CONCURRENT = 1
+MAX_DAILY_LOSS = 50.0
+COOLDOWN_AFTER_LOSS_TRADES = 3
+
+# --------------------
+# UTIL: feature engineering
+# --------------------
+def load_ticks_csv(path):
+    """
+    Expect CSV: epoch,quote
+    """
+    df = pd.read_csv(path)
+    df = df.sort_values("epoch").reset_index(drop=True)
+    return df
+
+def engineer_features(df, lookback=10):
+    """
+    Create features for each tick: returns, moving averages, momentum, volatility, last N deltas
+    We'll produce a dataset where label = price change after DURATION ticks (direction).
+    """
+    df = df.copy()
+    df['quote'] = df['quote'].astype(float)
+    df['ret1'] = df['quote'].pct_change().fillna(0)
+    df['ma5'] = df['quote'].rolling(window=5, min_periods=1).mean()
+    df['ma10'] = df['quote'].rolling(window=10, min_periods=1).mean()
+    df['std5'] = df['quote'].rolling(window=5, min_periods=1).std().fillna(0)
+    # last N deltas
+    for i in range(1, lookback+1):
+        df[f'delta_{i}'] = df['quote'].diff(i).fillna(0)
+    # drop early rows if needed
+    df = df.reset_index(drop=True)
+    return df
+
+def build_dataset(df, duration_ticks=5, lookback=10):
+    """
+    For each row t, label is whether price at t+duration > price at t (CALL) or < (PUT)
+    Returns X, y aligned (drops tail where forward price unknown)
+    """
+    df_feat = engineer_features(df, lookback=lookback)
+    df_feat['future_quote'] = df_feat['quote'].shift(-duration_ticks)
+    df_feat = df_feat.dropna(subset=['future_quote']).reset_index(drop=True)
+    # label: 1 = CALL (over), 0 = PUT (under), ties => 0 (PUT)
+    df_feat['label'] = (df_feat['future_quote'] > df_feat['quote']).astype(int)
+    feature_cols = ['ret1', 'ma5', 'ma10', 'std5'] + [f'delta_{i}' for i in range(1, lookback+1)]
+    X = df_feat[feature_cols].values
+    y = df_feat['label'].values
+    return X, y, feature_cols
+
+# --------------------
+# MODEL: train & save
+# --------------------
+def train_and_save_model(csv_path, model_path=MODEL_PATH):
+    df = load_ticks_csv(csv_path)
+    X, y, feature_cols = build_dataset(df)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=TRAIN_TEST_SPLIT, random_state=RANDOM_SEED, stratify=y)
+    clf = RandomForestClassifier(n_estimators=200, max_depth=8, random_state=RANDOM_SEED, n_jobs=-1)
+    clf.fit(X_train, y_train)
+    acc_train = clf.score(X_train, y_train)
+    acc_test = clf.score(X_test, y_test)
+    joblib.dump({'model': clf, 'features': feature_cols}, model_path)
+    print(f"Trained RF. train_acc={acc_train:.4f}, test_acc={acc_test:.4f}. Saved to {model_path}")
+    return clf, feature_cols
+
+# --------------------
+# BACKTESTER (simple)
+# --------------------
+def backtest(csv_path, model_path=MODEL_PATH, stake=STAKE, duration=DURATION):
+    if not os.path.exists(model_path):
+        print("Model not found. Train first.")
+        return
+    mm = joblib.load(model_path)
+    clf = mm['model']
+    features = mm['features']
+
+    df = load_ticks_csv(csv_path)
+    X, y, _ = build_dataset(df, duration_ticks=duration)
+    preds_proba = clf.predict_proba(X)[:,1]  # probability of CALL
+    preds = (preds_proba > 0.53).astype(int)  # threshold; tuneable
+
+    # simple P/L assumptions: if prediction==label => win, payout approximate 0.8*stake (example)
+    payout_ratio = 0.8  # placeholder; actual depends on contract payout
+    balance = 0.0
+    wins = losses = 0
+    for i, pred in enumerate(preds):
+        actual = y[i]
+        if pred == actual:
+            profit = payout_ratio * stake
+            balance += profit
+            wins += 1
+        else:
+            balance -= stake
+            losses += 1
+    total = wins + losses
+    win_rate = wins/total if total>0 else 0
+    print(f"Backtest result: balance={balance:.2f}, win_rate={win_rate:.3f}, trades={total}, wins={wins}, losses={losses}")
+    return {'balance': balance, 'win_rate': win_rate, 'trades': total}
+
+# --------------------
+# LIVE BOT SKELETON (uses model predictions)
+# --------------------
+# This skeleton receives ticks (e.g., from websocket), computes features for the current window,
+# asks the model for probability, checks risk constraints, then constructs the proposal->buy call.
+#
+# NOTE: You must implement the proposal->buy flow with Deriv's correct API endpoints.
+# The code below shows where to plug that in.
+
+tick_queue = Queue()
+tick_buffer = []  # store last N ticks for features
+LOOKBACK = 10
+open_trades = {}
+daily_loss = 0.0
+consecutive_losses = 0
+
+def load_model(path=MODEL_PATH):
+    if not os.path.exists(path):
+        raise FileNotFoundError("Model not trained. Run training first.")
+    mm = joblib.load(path)
+    return mm['model'], mm['features']
+
+MODEL, FEATURE_COLS = None, None
+
+def featurize_from_buffer(buffer):
+    """
+    buffer: list of recent quotes (floats), newest last
+    produce feature vector consistent with training
+    """
+    s = pd.Series(buffer)
+    quote = s.iat[-1]
+    ret1 = (s.iat[-1] - s.iat[-2]) / s.iat[-2] if len(s)>=2 and s.iat[-2]!=0 else 0.0
+    ma5 = s.tail(5).mean()
+    ma10 = s.tail(10).mean()
+    std5 = s.tail(5).std() if len(s)>=5 else 0.0
+    deltas = []
+    for i in range(1, LOOKBACK+1):
+        if len(s) > i:
+            deltas.append(quote - s.iat[-1-i])
+        else:
+            deltas.append(0.0)
+    vec = [ret1, ma5, ma10, std5] + deltas
+    return np.array(vec).reshape(1,-1)
+
+def allowed_to_trade():
+    global daily_loss, open_trades, consecutive_losses
+    if len(open_trades) >= MAX_CONCURRENT:
+        return False, "max concurrent reached"
+    if daily_loss <= -MAX_DAILY_LOSS:
+        return False, "daily loss limit reached"
+    if consecutive_losses >= COOLDOWN_AFTER_LOSS_TRADES:
+        return False, "cooldown due to losses"
+    return True, ""
+
+def place_trade_decision(prob_call, stake=STAKE):
+    """
+    Decide: if prob_call > thresh => BUY CALL, if prob_call < 1-thresh => BUY PUT, else skip
+    """
+    thresh = 0.56
+    if prob_call >= thresh:
+        return "CALL"
+    if prob_call <= (1-thresh):
+        return "PUT"
+    return None
+
+def execute_buy(ws_send_func, contract_direction, stake, duration, symbol):
+    """
+    ws_send_func: function that takes JSON and sends to websocket. Replace with your WS send.
+    This function must:
+      1) request a proposal for the desired contract parameters
+      2) receive proposal (with ask price)
+      3) send buy with proposal id
+    Here we'll show a placeholder request structure; implement exact fields per Deriv docs.
+    """
+    proposal_request = {
+        "proposal": 1,
+        "parameters": {
+            "amount": stake,
+            "basis": "stake",
+            "contract_type": contract_direction,
+            "duration": duration,
+            "duration_unit": "t",
+            "symbol": symbol
+        }
+    }
+    # send proposal
+    ws_send_func(json.dumps(proposal_request))
+
+    # Real code should wait for the proposal response, then call buy with proposal id.
+    # Placeholder:
+    print("SENT proposal (placeholder). Implement full proposal->buy sequence with Deriv API.")
+
+# Example tick processor (simulate using tick inputs)
+def tick_processor(ws_send_func):
+    global tick_buffer, MODEL, FEATURE_COLS, open_trades, daily_loss, consecutive_losses
+    while True:
+        tick = tick_queue.get()
+        price = float(tick['quote'])
+        tick_buffer.append(price)
+        if len(tick_buffer) > 200:
+            tick_buffer.pop(0)
+        # wait for minimum history
+        if len(tick_buffer) < LOOKBACK + 2:
+            continue
+        # featurize and predict
+        vec = featurize_from_buffer(tick_buffer[-(LOOKBACK+2):])  # ensure enough history
+        prob = MODEL.predict_proba(vec)[0,1]  # probability of CALL
+        direction = place_trade_decision(prob)
+        allowed, reason = allowed_to_trade()
+        if direction and allowed:
+            # placeholder send
+            execute_buy(ws_send_func, direction, STAKE, DURATION, SYMBOL)
+            # update open_trades etc once buy confirmation arrives (not implemented here)
+        else:
+            # skip
+            pass
+
+# --------------------
+# CLI helpers
+# --------------------
+def train_cli():
+    train_and_save_model(HISTORICAL_TICKS_CSV)
+
+def backtest_cli():
+    backtest(HISTORICAL_TICKS_CSV)
+
+def run_live_demo():
+    """
+    Demo with simulated ticks: read file and stream ticks into the tick_queue so
+    the live processor can act. Replace ws_send_junk with real send when integrating with websocket.
+    """
+    global MODEL, FEATURE_COLS
+    MODEL, FEATURE_COLS = load_model()
+    # start processor thread
+    def ws_send_dummy(payload):
+        print("[WS SEND]", payload[:200])
+    t = threading.Thread(target=tick_processor, args=(ws_send_dummy,), daemon=True)
+    t.start()
+
+    # stream ticks from CSV as demo
+    df = load_ticks_csv(HISTORICAL_TICKS_CSV)
+    for _, row in df.iterrows():
+        tick_queue.put({'quote': row['quote'], 'epoch': row['epoch']})
+        time.sleep(0.01)  # speed: slow for demo
+
+# --------------------
+# MAIN
+# --------------------
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--train", action="store_true", help="Train model on CSV")
+    p.add_argument("--backtest", action="store_true", help="Run backtest")
+    p.add_argument("--live-demo", action="store_true", help="Run live demo streaming CSV ticks")
+    args = p.parse_args()
+    if args.train:
+        train_cli()
+    elif args.backtest:
+        backtest_cli()
+    elif args.live_demo:
+        run_live_demo()
+    else:
+        print("Options: --train, --backtest, --live-demo")
